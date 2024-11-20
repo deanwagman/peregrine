@@ -2,16 +2,10 @@
 
 const yargs = require("yargs");
 const { hideBin } = require("yargs/helpers");
-const fs = require("fs");
+const sqlite3 = require('sqlite3').verbose();
 
 const options = yargs(hideBin(process.argv))
-  .usage("Usage: yarn filter -m <model> -p <property>")
-  .option("input", {
-    alias: "i",
-    describe: "The data file to be processed",
-    type: "string",
-    default: "entities.json",
-  })
+  .usage("Usage: node index.js [--models <model1> <model2> ...] --properties <property>")
   .option("models", {
     alias: "m",
     describe: "Model(s) to include",
@@ -21,10 +15,13 @@ const options = yargs(hideBin(process.argv))
     alias: "p",
     type: "array",
     describe: `
-    Properties to filter on.
-    Assumes no key has ':' or ' ' and no property has ','. Format key:value1,value2
+      Properties to filter on.
+      Assumes no key has ':' or ' ' and no property has ','. Format key:value1,value2
     `,
-  }).argv;
+  })
+  .help()
+  .alias('help', 'h')
+  .argv;
 
 const parseValue = (value) => {
   try {
@@ -33,8 +30,6 @@ const parseValue = (value) => {
     return value;
   }
 };
-
-const data = JSON.parse(fs.readFileSync(options.input, "utf8"));
 
 /**
  * Parses an array of property filters and returns a map of property keys to their respective values.
@@ -63,90 +58,142 @@ function parsePropertyFilters(propertyFilters) {
   return propertyFilterMap;
 }
 
+// Define boolean columns
+const booleanColumns = ['stolen', 'impounded'];
+
 /**
- * Filters an array of data entities based on model and property filters.
+ * Retrieves all table names from the SQLite database.
  *
- * @param {Array} data - The array of data entities to filter.
- * @param {Array} modelFilters - An array of model names to filter by. If null or empty, all models are included.
- * @param {Object} propertyFilterMap - An object where keys are property slugs and values are arrays of acceptable values for those properties.
- * @returns {Array} - The filtered array of data entities.
- *
- * ex:
- * [
- *   {
- *     "model": "model1",
- *     "properties": [
- *       {
- *          "slug": "property1",
- *          "value": "value1"
- *       },
- *       {
- *          "slug": "property2",
- *          "value": "value3"
- *       }
- *    ]
- *  },
- * ...
- * ]
+ * @param {sqlite3.Database} db - The SQLite database instance.
+ * @returns {Promise<string[]>} - A promise that resolves to an array of table names.
  */
-function filterData(data, modelFilters, propertyFilterMap) {
-  return data.filter((entity) => {
-    // Model filter (union)
-    const modelMatch =
-      !modelFilters ||
-      modelFilters.length === 0 ||
-      modelFilters.includes(entity.model);
-
-    // Property filters (intersect of keys, union of values)
-    const propertyMatch = Object.keys(propertyFilterMap).every((key) => {
-      const acceptableValues = propertyFilterMap[key];
-      const prop = entity.properties.find((p) => p.slug === key);
-
-      if (!prop || prop.value === null) return false;
-
-      return acceptableValues.includes(prop.value);
+function getAllTableNames(db) {
+  return new Promise((resolve, reject) => {
+    const query = `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';`;
+    db.all(query, [], (err, rows) => {
+      if (err) {
+        return reject(err);
+      }
+      const tableNames = rows.map(row => row.name);
+      resolve(tableNames);
     });
-
-    return modelMatch && propertyMatch;
   });
 }
 
 /**
- * Aggregates data from an array of entities based on their properties.
+ * Queries the database to fetch data based on model and property filters.
  *
- * @param {Array} filteredData - The array of entities to aggregate. Each entity should have a `properties` array.
- * @param {Array} filteredData[].properties - The properties of each entity.
- * @param {Object} filteredData[].properties[].slug - The slug of the property.
- * @param {any} filteredData[].properties[].value - The value of the property.
- * @returns {Object} An object where each key is a property slug and the value is an object
- *                   mapping each unique property value to its count.
- * {
- *   "property1": {
- *     "value1": 2,
- *     "value2": 1,
- *   },
- *   "property2": {
- *     "value3": 3,
- *     "value4": 1,
- *   },
- * }
+ * @param {Array} modelFilters - An array of model names to filter by. If empty, fetch all models.
+ * @param {Object} propertyFilterMap - An object where keys are property names and values are arrays of acceptable values.
+ * @returns {Promise<Array>} - A promise that resolves to the filtered array of data entities.
  */
-function aggregateData(filteredData) {
-  const aggregation = {};
-  filteredData.forEach((entity) => {
-    entity.properties.forEach((prop) => {
-      const slug = prop.slug;
-      const value = prop.value;
-      if (value === null) return; // Skip null values
-
-      if (!aggregation[slug]) {
-        aggregation[slug] = {};
+async function queryDatabase(modelFilters, propertyFilterMap) {
+  return new Promise((resolve, reject) => {
+    const db = new sqlite3.Database('./sqlite/db.sqlite', async (err) => {
+      if (err) {
+        return reject(err);
       }
 
-      const valueKey =
-        typeof value === "string" ? value : JSON.stringify(value);
+      try {
+        let tablesToQuery = modelFilters;
+        if (!modelFilters || modelFilters.length === 0) {
+          tablesToQuery = await getAllTableNames(db);
+          if (tablesToQuery.length === 0) {
+            throw new Error("No tables found in the database.");
+          }
+        }
 
-      aggregation[slug][valueKey] = (aggregation[slug][valueKey] || 0) + 1;
+        const queries = [];
+        const allResults = [];
+
+        tablesToQuery.forEach((model) => {
+          let query = `SELECT * FROM "${model}"`;
+          const conditions = [];
+          const params = [];
+
+          Object.keys(propertyFilterMap).forEach((key) => {
+            const values = propertyFilterMap[key];
+            if (values.length > 0) {
+              conditions.push(`"${key}" IN (${values.map(() => '?').join(', ')})`);
+              params.push(...values);
+            }
+          });
+
+          if (conditions.length > 0) {
+            query += ' WHERE ' + conditions.join(' AND ');
+          }
+
+          queries.push({ query, params });
+        });
+
+        // Execute each query sequentially
+        for (const { query, params } of queries) {
+          const rows = await new Promise((res, rej) => {
+            db.all(query, params, (err, rows) => {
+              if (err) {
+                rej(err);
+              } else {
+                res(rows);
+              }
+            });
+          });
+          allResults.push(...rows);
+        }
+
+        if (allResults.length === 0) {
+          console.log("No data found for the specified filters.");
+        }
+
+        db.close((err) => {
+          if (err) {
+            return reject(err);
+          }
+          resolve(allResults);
+        });
+      } catch (error) {
+        db.close(() => {
+          reject(error);
+        });
+      }
+    });
+  });
+}
+
+/**
+ * Aggregates data from an array of flat entities based on their properties.
+ *
+ * @param {Array} filteredData - The array of entities to aggregate.
+ * @returns {Object} An object where each key is a property and the value is an object
+ *                   mapping each unique property value to its count.
+ */
+function aggregateData(filteredData) {
+  if (!Array.isArray(filteredData)) {
+    throw new TypeError("Expected an array of filtered data");
+  }
+
+  const aggregation = {};
+
+  filteredData.forEach((entity) => {
+    Object.keys(entity).forEach((key) => {
+      let value = entity[key];
+      if (value === null || value === undefined) return; // Skip null or undefined values
+
+      // Map 0 and 1 to false and true for boolean columns
+      if (booleanColumns.includes(key)) {
+        if (value === 1) {
+          value = true;
+        } else if (value === 0) {
+          value = false;
+        }
+      }
+
+      const valueKey = typeof value === "string" ? value : JSON.stringify(value);
+
+      if (!aggregation[key]) {
+        aggregation[key] = {};
+      }
+
+      aggregation[key][valueKey] = (aggregation[key][valueKey] || 0) + 1;
     });
   });
 
@@ -156,48 +203,36 @@ function aggregateData(filteredData) {
 /**
  * Formats an aggregation object by sorting the counts in descending order.
  *
- * @param {Object} aggregation - The aggregation object where keys are slugs and values are objects with counts.
+ * @param {Object} aggregation - The aggregation object where keys are properties and values are objects with counts.
  * @returns {Object} - A new object with the same keys as the input, but with the counts sorted in descending order.
- *
- * ex:
- *  {
- *    "property1": [
- *      ["value1", 2],
- *      ["value2", 1],
- *    ],
- *    "property2": [
- *      ["value3", 3],
- *      ["value4", 1],
- *    ],
- *  }
  */
 function formatAggregation(aggregation) {
   const result = {};
-  Object.keys(aggregation).forEach((slug) => {
-    const counts = aggregation[slug];
+  Object.keys(aggregation).forEach((key) => {
+    const counts = aggregation[key];
     const sortedAggregations = Object.entries(counts)
-      .map(([value, count]) => [parseValue(value), count])
+      .map(([value, count]) => [value, count]) // Booleans are already mapped
       .sort((a, b) => b[1] - a[1]); // Sort by count descending
 
-    result[slug] = sortedAggregations;
+    result[key] = sortedAggregations;
   });
 
   return result;
 }
 
 /**
- * Takes a list of entity objects, filters data matching the `models` and `properties` specifications,
- * and then aggregates the data returning a sorted list of aggregations.
+ * Runs the aggregation process.
  *
- * @param data - The list entity data
- * @param modelFilters - A list of models to filter the aggregation on
- * @param propertyFilters - A list of property keys and values to filter the aggregation on. Format: key:value1,value2
- *
- * @returns A dictionary of property slugs to a sorted list of aggregations
+ * @param {Array} modelFilters - A list of models to filter the aggregation on.
+ * @param {Array} propertyFilters - A list of property filters.
+ * @returns {Promise<Object>} - The formatted aggregation result.
  */
-function run(data, modelFilters, propertyFilters) {
+async function run(modelFilters, propertyFilters) {
   const propertyFilterMap = parsePropertyFilters(propertyFilters);
-  const filteredData = filterData(data, modelFilters, propertyFilterMap);
+  const filteredData = await queryDatabase(modelFilters, propertyFilterMap);
+  if (!Array.isArray(filteredData)) {
+    throw new TypeError("Expected an array of filtered data");
+  }
   const aggregation = aggregateData(filteredData);
   const formattedAggregation = formatAggregation(aggregation);
 
@@ -205,4 +240,10 @@ function run(data, modelFilters, propertyFilters) {
 }
 
 // 🤖
-console.log(run(data, options.models, options.properties));
+run(options.models, options.properties)
+  .then(result => {
+    console.log(JSON.stringify(result, null, 2));
+  })
+  .catch(err => {
+    console.error("Error:", err.message);
+  });
