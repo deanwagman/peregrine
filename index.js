@@ -37,17 +37,44 @@ const parseValue = (value) => {
   }
 };
 
+// Define boolean columns, this is used to map 0 and 1 to false and true
+const booleanColumns = ["stolen", "impounded"];
+
+/**
+ * Captures command line arguments passed to the script, excluding the first two elements,
+ * and joins them into a single string.
+ *
+ * @returns {string} The command line arguments joined into a single string.
+ */
 const captureCommand = () => {
   const args = process.argv.slice(2); // Skip the first two elements
   return args.join(" ");
 };
 
+/**
+ * Retrieves the username of the current user.
+ *
+ * This function attempts to get the username from the operating system's user information.
+ * If that fails, it tries to get the username from the environment variables `USER` or `USERNAME`.
+ * If both methods fail, it returns "unknown user".
+ *
+ * @returns {string} The username of the current user or "unknown user" if it cannot be determined.
+ */
 const getUsername = () => {
   const osUserInfo = os.userInfo().username;
   const envUsername = process.env.USER || process.env.USERNAME;
   return osUserInfo || envUsername || "unknown user";
 };
 
+/**
+ * Logs a command to the database.
+ *
+ * @param {Object} db - The database connection object.
+ * @param {Function} db.run - The method to execute the SQL query.
+ * @param {string} db.run.sql - The SQL query to be executed.
+ * @param {Array} db.run.params - The parameters for the SQL query.
+ * @param {Function} db.run.callback - The callback function to handle the result.
+ */
 const logCommand = (db) => {
   const insertQuery = `INSERT INTO log (command, username) VALUES (?, ?)`;
   const command = captureCommand();
@@ -56,8 +83,6 @@ const logCommand = (db) => {
   db.run(insertQuery, [command, username], (err) => {
     if (err) {
       console.error(`Error logging command:`, err.message);
-    } else {
-      console.log(`Command logged: "${command}" by user "${username}"`);
     }
   });
 };
@@ -89,9 +114,6 @@ function parsePropertyFilters(propertyFilters) {
   return propertyFilterMap;
 }
 
-// Define boolean columns
-const booleanColumns = ["stolen", "impounded"];
-
 /**
  * Retrieves all table names from the SQLite database.
  *
@@ -116,8 +138,6 @@ const ensureDatabase = async () => {
   if (!fs.existsSync(dbPath)) {
     console.log("Database not found. Running import script...");
     await setupDatabase();
-  } else {
-    console.log("Database exists. Skipping import.");
   }
 };
 
