@@ -2,10 +2,17 @@
 
 const yargs = require("yargs");
 const { hideBin } = require("yargs/helpers");
-const sqlite3 = require('sqlite3').verbose();
+const sqlite3 = require("sqlite3").verbose();
+const os = require("os");
+const fs = require("fs");
+const setupDatabase = require("./sqlite/import-data");
+
+const dbPath = "./sqlite/db.sqlite";
 
 const options = yargs(hideBin(process.argv))
-  .usage("Usage: node index.js [--models <model1> <model2> ...] --properties <property>")
+  .usage(
+    "Usage: node index.js [--models <model1> <model2> ...] --properties <property>"
+  )
   .option("models", {
     alias: "m",
     describe: "Model(s) to include",
@@ -20,8 +27,7 @@ const options = yargs(hideBin(process.argv))
     `,
   })
   .help()
-  .alias('help', 'h')
-  .argv;
+  .alias("help", "h").argv;
 
 const parseValue = (value) => {
   try {
@@ -29,6 +35,31 @@ const parseValue = (value) => {
   } catch (e) {
     return value;
   }
+};
+
+const captureCommand = () => {
+  const args = process.argv.slice(2); // Skip the first two elements
+  return args.join(" ");
+};
+
+const getUsername = () => {
+  const osUserInfo = os.userInfo().username;
+  const envUsername = process.env.USER || process.env.USERNAME;
+  return osUserInfo || envUsername || "unknown user";
+};
+
+const logCommand = (db) => {
+  const insertQuery = `INSERT INTO log (command, username) VALUES (?, ?)`;
+  const command = captureCommand();
+  const username = getUsername();
+
+  db.run(insertQuery, [command, username], (err) => {
+    if (err) {
+      console.error(`Error logging command:`, err.message);
+    } else {
+      console.log(`Command logged: "${command}" by user "${username}"`);
+    }
+  });
 };
 
 /**
@@ -59,7 +90,7 @@ function parsePropertyFilters(propertyFilters) {
 }
 
 // Define boolean columns
-const booleanColumns = ['stolen', 'impounded'];
+const booleanColumns = ["stolen", "impounded"];
 
 /**
  * Retrieves all table names from the SQLite database.
@@ -74,11 +105,21 @@ function getAllTableNames(db) {
       if (err) {
         return reject(err);
       }
-      const tableNames = rows.map(row => row.name);
+      const tableNames = rows.map((row) => row.name);
       resolve(tableNames);
     });
   });
 }
+
+// Check if the database exists and run the import script if necessary
+const ensureDatabase = async () => {
+  if (!fs.existsSync(dbPath)) {
+    console.log("Database not found. Running import script...");
+    await setupDatabase();
+  } else {
+    console.log("Database exists. Skipping import.");
+  }
+};
 
 /**
  * Queries the database to fetch data based on model and property filters.
@@ -88,75 +129,82 @@ function getAllTableNames(db) {
  * @returns {Promise<Array>} - A promise that resolves to the filtered array of data entities.
  */
 async function queryDatabase(modelFilters, propertyFilterMap) {
-  return new Promise((resolve, reject) => {
-    const db = new sqlite3.Database('./sqlite/db.sqlite', async (err) => {
-      if (err) {
-        return reject(err);
+  await ensureDatabase();
+
+  const db = new sqlite3.Database(dbPath);
+
+  try {
+    let tablesToQuery = modelFilters;
+    if (!modelFilters || modelFilters.length === 0) {
+      tablesToQuery = await getAllTableNames(db);
+      if (tablesToQuery.length === 0) {
+        throw new Error("No tables found in the database.");
+      }
+    }
+
+    const queries = [];
+    const allResults = [];
+
+    tablesToQuery.forEach((model) => {
+      let query = `SELECT * FROM "${model}"`;
+      const conditions = [];
+      const params = [];
+
+      Object.keys(propertyFilterMap).forEach((key) => {
+        const values = propertyFilterMap[key];
+        if (values.length > 0) {
+          conditions.push(`"${key}" IN (${values.map(() => "?").join(", ")})`);
+          params.push(...values);
+        }
+      });
+
+      if (conditions.length > 0) {
+        query += " WHERE " + conditions.join(" AND ");
       }
 
-      try {
-        let tablesToQuery = modelFilters;
-        if (!modelFilters || modelFilters.length === 0) {
-          tablesToQuery = await getAllTableNames(db);
-          if (tablesToQuery.length === 0) {
-            throw new Error("No tables found in the database.");
-          }
-        }
-
-        const queries = [];
-        const allResults = [];
-
-        tablesToQuery.forEach((model) => {
-          let query = `SELECT * FROM "${model}"`;
-          const conditions = [];
-          const params = [];
-
-          Object.keys(propertyFilterMap).forEach((key) => {
-            const values = propertyFilterMap[key];
-            if (values.length > 0) {
-              conditions.push(`"${key}" IN (${values.map(() => '?').join(', ')})`);
-              params.push(...values);
-            }
-          });
-
-          if (conditions.length > 0) {
-            query += ' WHERE ' + conditions.join(' AND ');
-          }
-
-          queries.push({ query, params });
-        });
-
-        // Execute each query sequentially
-        for (const { query, params } of queries) {
-          const rows = await new Promise((res, rej) => {
-            db.all(query, params, (err, rows) => {
-              if (err) {
-                rej(err);
-              } else {
-                res(rows);
-              }
-            });
-          });
-          allResults.push(...rows);
-        }
-
-        if (allResults.length === 0) {
-          console.log("No data found for the specified filters.");
-        }
-
-        db.close((err) => {
-          if (err) {
-            return reject(err);
-          }
-          resolve(allResults);
-        });
-      } catch (error) {
-        db.close(() => {
-          reject(error);
-        });
-      }
+      queries.push({ query, params });
     });
-  });
+
+    // Execute each query sequentially
+    for (const { query, params } of queries) {
+      const rows = await new Promise((resolve, reject) => {
+        db.all(query, params, (err, rows) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve(rows);
+          }
+        });
+      });
+      allResults.push(...rows);
+    }
+
+    if (allResults.length === 0) {
+      console.log("No data found for the specified filters.");
+    }
+
+    // Log the command to the database for auditing
+    logCommand(db);
+
+    await new Promise((resolve, reject) => {
+      db.close((err) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve();
+        }
+      });
+    });
+
+    return allResults;
+  } catch (error) {
+    await new Promise((resolve) => {
+      db.close(() => {
+        resolve();
+      });
+    });
+    throw error;
+  }
 }
 
 /**
@@ -187,7 +235,8 @@ function aggregateData(filteredData) {
         }
       }
 
-      const valueKey = typeof value === "string" ? value : JSON.stringify(value);
+      const valueKey =
+        typeof value === "string" ? value : JSON.stringify(value);
 
       if (!aggregation[key]) {
         aggregation[key] = {};
@@ -228,6 +277,8 @@ function formatAggregation(aggregation) {
  * @returns {Promise<Object>} - The formatted aggregation result.
  */
 async function run(modelFilters, propertyFilters) {
+  await ensureDatabase();
+
   const propertyFilterMap = parsePropertyFilters(propertyFilters);
   const filteredData = await queryDatabase(modelFilters, propertyFilterMap);
   if (!Array.isArray(filteredData)) {
@@ -241,9 +292,11 @@ async function run(modelFilters, propertyFilters) {
 
 // 🤖
 run(options.models, options.properties)
-  .then(result => {
+  .then((result) => {
     console.log(JSON.stringify(result, null, 2));
   })
-  .catch(err => {
+  .catch((err) => {
     console.error("Error:", err.message);
   });
+
+module.exports = { run };

@@ -4,12 +4,16 @@
   "description": "Peregrine's take-home prompt",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "aggregate": "node index.js"
+    "test": "jest",
+    "aggregate": "node index.js",
+    "import-data": "node sqlite/import-data.js"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
     "yargs": "^17.1.1"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
   }
 }
