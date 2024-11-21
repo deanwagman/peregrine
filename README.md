@@ -26,7 +26,7 @@ yarn aggregate --properties first_name:ben,elise last_name:lopez
 yarn aggregate --properties year:2008
 ```
 
-# Thank You, Peregrine!
+# Thank You, [REDACTED]!
 
-I want to express my sincere appreciation to **Peregrine** for the opportunity to work on this project.
+I want to express my sincere appreciation to **[REDACTED]** for the opportunity to work on this project.
 I value the time work you do, and I am very grateful for the opportunity to work with you.
